@@ -1,6 +1,7 @@
 use crate::error::{Error, Result};
 use crate::pose::{Confidence, Pose, TrackerState};
 use crate::protocol::*;
+use crate::video::VideoFrame;
 use rusb::{DeviceHandle, GlobalContext};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc;
@@ -11,8 +12,9 @@ pub struct T265Device {
     handle: Arc<DeviceHandle<GlobalContext>>,
     device_id: String,
     time_offset_ns: i64,
-    running: Arc<AtomicBool>,
+    pose_streaming: Arc<AtomicBool>,
     current_mode: u8,
+    video_streaming: Arc<AtomicBool>,
 }
 
 impl T265Device {
@@ -21,8 +23,9 @@ impl T265Device {
             handle: Arc::new(handle),
             device_id,
             time_offset_ns: 0,
-            running: Arc::new(AtomicBool::new(false)),
+            pose_streaming: Arc::new(AtomicBool::new(false)),
             current_mode: SIXDOF_MODE_ENABLE_MAPPING | SIXDOF_MODE_ENABLE_RELOCALIZATION,
+            video_streaming: Arc::new(AtomicBool::new(false)),
         }
     }
 
@@ -71,15 +74,15 @@ impl T265Device {
                 if status == DEVICE_BUSY {
                     return Err(Error::DeviceBusy);
                 }
-                // some other error idk
-                return Err(Error::CommandFailed(status));
+                // Return detailed error with human-readable message
+                return Err(Error::from_status(status));
             }
         }
 
         Ok(resp)
     }
 
-    pub fn enable_6dof(&mut self, mode: u8) -> Result<()> {
+    pub(crate) fn enable_6dof(&mut self, mode: u8) -> Result<()> {
         let req = BulkMessageRequest6DofControl {
             header: BulkMessageRequestHeader {
                 dw_length: 9,
@@ -95,10 +98,11 @@ impl T265Device {
     }
 
     /// I dont think this works
-    pub fn set_interrupt_rate(&self, rate: u8) -> Result<()> {
+    #[allow(dead_code)]
+    pub(crate) fn set_interrupt_rate(&self, rate: u8) -> Result<()> {
         let req = BulkMessageRequestSet6DofInterruptRate {
             header: BulkMessageRequestHeader {
-                dw_length: 7,
+                dw_length: 5,
                 w_message_id: SLAM_SET_6DOF_INTERRUPT_RATE,
             },
             b_interrupt_rate: rate,
@@ -108,10 +112,10 @@ impl T265Device {
         Ok(())
     }
 
-    pub fn start_streaming(&self) -> Result<()> {
+    pub(crate) fn start_streaming(&self) -> Result<()> {
         let req = BulkMessageRequestStart {
             header: BulkMessageRequestHeader {
-                dw_length: 6,
+                dw_length: 4,
                 w_message_id: DEV_START,
             },
         };
@@ -120,10 +124,10 @@ impl T265Device {
         Ok(())
     }
 
-    pub fn stop_streaming(&self) -> Result<()> {
+    pub(crate) fn stop_streaming(&self) -> Result<()> {
         let req = BulkMessageRequestStop {
             header: BulkMessageRequestHeader {
-                dw_length: 6,
+                dw_length: 4,
                 w_message_id: DEV_STOP,
             },
         };
@@ -132,7 +136,7 @@ impl T265Device {
         Ok(())
     }
 
-    pub fn sync_time(&mut self) -> Result<()> {
+    pub(crate) fn sync_time(&mut self) -> Result<()> {
         let host_start = Instant::now();
 
         let req = BulkMessageRequestGetTime {
@@ -273,21 +277,20 @@ impl T265Device {
         }
     }
 
-    pub fn start_pose_stream(&mut self, tx: mpsc::Sender<Pose>) -> Result<()> {
-        // Use the current mode instead of always resetting to NORMAL
+    pub(crate) fn start_pose_stream(&mut self, tx: mpsc::Sender<Pose>) -> Result<()> {
         self.enable_6dof(self.current_mode)?;
         self.start_streaming()?;
 
         let handle = self.handle.clone();
         let device_id = self.device_id.clone();
         let time_offset = self.time_offset_ns;
-        let running = Arc::clone(&self.running);
-        running.store(true, Ordering::SeqCst);
+        let pose_streaming = Arc::clone(&self.pose_streaming);
+        pose_streaming.store(true, Ordering::SeqCst);
 
         std::thread::spawn(move || {
             let mut buffer = vec![0u8; 128];
 
-            while running.load(Ordering::SeqCst) {
+            while pose_streaming.load(Ordering::SeqCst) {
                 match handle.read_interrupt(
                     ENDPOINT_INTERRUPT_IN,
                     &mut buffer,
@@ -347,9 +350,7 @@ impl T265Device {
                                 let status = msg.w_status;
                                 match status {
                                     DEVICE_STOPPED => {
-                                        // Check if we're actually supposed to be running
-                                        // If running is true, this is a stale message from a previous stop
-                                        if running.load(Ordering::SeqCst) {
+                                        if pose_streaming.load(Ordering::SeqCst) {
                                             eprintln!("Device {} received stale STOPPED message, ignoring", device_id);
                                         } else {
                                             eprintln!("Device {} stopped", device_id);
@@ -382,15 +383,284 @@ impl T265Device {
         Ok(())
     }
 
-    pub fn stop_pose_stream(&mut self) -> Result<()> {
-        self.running.store(false, Ordering::SeqCst);
+    pub(crate) fn stop_pose_stream(&mut self) -> Result<()> {
+        self.pose_streaming.store(false, Ordering::SeqCst);
         std::thread::sleep(std::time::Duration::from_millis(200));
         self.stop_streaming()?;
         Ok(())
     }
+
+    pub(crate) fn get_supported_video_streams(&self) -> Result<Vec<SupportedRawStreamMessage>> {
+        let request = BulkMessageRequestGetSupportedRawStreams {
+            header: BulkMessageRequestHeader {
+                dw_length: std::mem::size_of::<BulkMessageRequestGetSupportedRawStreams>() as u32,
+                w_message_id: DEV_GET_SUPPORTED_RAW_STREAMS,
+            },
+        };
+
+        let req_bytes = bytemuck::bytes_of(&request);
+        self.handle
+            .write_bulk(ENDPOINT_CONTROL_OUT, req_bytes, USB_TIMEOUT)?;
+
+        let mut buffer = vec![0u8; 1024];
+        let bytes_read = self
+            .handle
+            .read_bulk(ENDPOINT_CONTROL_IN, &mut buffer, USB_TIMEOUT)?;
+
+        if bytes_read < std::mem::size_of::<BulkMessageResponseGetSupportedRawStreamsHeader>() {
+            return Err(Error::Protocol(
+                "Response too short for GetSupportedRawStreams".to_string(),
+            ));
+        }
+
+        let header: BulkMessageResponseGetSupportedRawStreamsHeader = bytemuck::pod_read_unaligned(
+            &buffer[..std::mem::size_of::<BulkMessageResponseGetSupportedRawStreamsHeader>()],
+        );
+
+        if header.header.w_status != SUCCESS {
+            return Err(Error::from_status(header.header.w_status));
+        }
+
+        let num_streams = header.w_num_supported_streams as usize;
+        let streams_offset = std::mem::size_of::<BulkMessageResponseGetSupportedRawStreamsHeader>();
+        let stream_size = std::mem::size_of::<SupportedRawStreamMessage>();
+
+        let mut streams = Vec::new();
+        for i in 0..num_streams {
+            let offset = streams_offset + (i * stream_size);
+            if offset + stream_size > bytes_read {
+                break;
+            }
+            let stream: SupportedRawStreamMessage =
+                bytemuck::pod_read_unaligned(&buffer[offset..offset + stream_size]);
+            streams.push(stream);
+        }
+
+        Ok(streams)
+    }
+
+    pub(crate) fn enable_video_streams(&self, streams: &[SupportedRawStreamMessage]) -> Result<()> {
+        if streams.is_empty() {
+            return Ok(());
+        }
+
+        let header_size = std::mem::size_of::<BulkMessageRequestRawStreamsControlHeader>();
+        let stream_size = std::mem::size_of::<SupportedRawStreamMessage>();
+        let total_size = header_size + (streams.len() * stream_size);
+
+        let mut buffer = vec![0u8; total_size];
+
+        let request_header = BulkMessageRequestRawStreamsControlHeader {
+            header: BulkMessageRequestHeader {
+                dw_length: total_size as u32,
+                w_message_id: DEV_RAW_STREAMS_CONTROL,
+            },
+            w_num_enabled_streams: streams.len() as u16,
+        };
+
+        buffer[..header_size].copy_from_slice(bytemuck::bytes_of(&request_header));
+
+        for (i, stream) in streams.iter().enumerate() {
+            let offset = header_size + (i * stream_size);
+            buffer[offset..offset + stream_size].copy_from_slice(bytemuck::bytes_of(stream));
+        }
+
+        self.handle
+            .write_bulk(ENDPOINT_CONTROL_OUT, &buffer, USB_TIMEOUT)?;
+
+        let mut resp_buffer = vec![0u8; 64];
+        let bytes_read =
+            self.handle
+                .read_bulk(ENDPOINT_CONTROL_IN, &mut resp_buffer, USB_TIMEOUT)?;
+
+        if bytes_read < std::mem::size_of::<BulkMessageResponseRawStreamsControl>() {
+            return Err(Error::Protocol(
+                "Response too short for RawStreamsControl".to_string(),
+            ));
+        }
+
+        let response: BulkMessageResponseRawStreamsControl = bytemuck::pod_read_unaligned(
+            &resp_buffer[..std::mem::size_of::<BulkMessageResponseRawStreamsControl>()],
+        );
+
+        if response.header.w_status != SUCCESS {
+            return Err(Error::from_status(response.header.w_status));
+        }
+
+        Ok(())
+    }
+
+    pub(crate) fn start_video_stream(&self) -> Result<mpsc::Receiver<VideoFrame>> {
+        if self.video_streaming.load(Ordering::SeqCst) {
+            return Err(Error::DeviceAlreadyOpen);
+        }
+
+        // Start device streaming if pose stream hasn't already started it
+        if !self.pose_streaming.load(Ordering::SeqCst) {
+            self.start_streaming()?;
+        }
+
+        let (tx, rx) = mpsc::channel();
+        let handle = self.handle.clone();
+        let device_id = self.device_id.clone();
+        let video_streaming = self.video_streaming.clone();
+        let time_offset_ns = self.time_offset_ns;
+
+        video_streaming.store(true, Ordering::SeqCst);
+
+        std::thread::spawn(move || {
+            const MAX_FRAME_SIZE: usize = 848 * 800 + 1024;
+            let mut buffer = vec![0u8; MAX_FRAME_SIZE];
+
+            while video_streaming.load(Ordering::SeqCst) {
+                match handle.read_bulk(
+                    ENDPOINT_STREAM_IN,
+                    &mut buffer,
+                    std::time::Duration::from_millis(1000),
+                ) {
+                    Ok(size) if size >= std::mem::size_of::<BulkMessageRequestHeader>() => {
+                        let header: BulkMessageRequestHeader = bytemuck::pod_read_unaligned(
+                            &buffer[..std::mem::size_of::<BulkMessageRequestHeader>()],
+                        );
+
+                        let msg_id = header.w_message_id;
+
+                        match msg_id {
+                            DEV_SAMPLE
+                                if size >= std::mem::size_of::<BulkMessageRawStreamHeader>() =>
+                            {
+                                let stream_header: BulkMessageRawStreamHeader =
+                                    bytemuck::pod_read_unaligned(
+                                        &buffer
+                                            [..std::mem::size_of::<BulkMessageRawStreamHeader>()],
+                                    );
+
+                                let sensor_type = get_sensor_type(stream_header.b_sensor_id);
+                                let sensor_index = get_sensor_index(stream_header.b_sensor_id);
+
+                                if sensor_type == SENSOR_TYPE_FISHEYE {
+                                    let metadata_offset =
+                                        std::mem::size_of::<BulkMessageRawStreamHeader>();
+
+                                    if size
+                                        >= metadata_offset
+                                            + std::mem::size_of::<
+                                                BulkMessageVideoStreamMetadataHeader,
+                                            >()
+                                    {
+                                        let metadata: BulkMessageVideoStreamMetadataHeader =
+                                            bytemuck::pod_read_unaligned(
+                                                &buffer[metadata_offset
+                                                    ..metadata_offset
+                                                        + std::mem::size_of::<
+                                                            BulkMessageVideoStreamMetadataHeader,
+                                                        >(
+                                                        )],
+                                            );
+
+                                        let data_offset = metadata_offset
+                                            + std::mem::size_of::<
+                                                BulkMessageVideoStreamMetadataHeader,
+                                            >();
+                                        let frame_length = metadata.dw_frame_length as usize;
+
+                                        if data_offset + frame_length <= size {
+                                            let frame_data = buffer
+                                                [data_offset..data_offset + frame_length]
+                                                .to_vec();
+
+                                            let width = 848u16;
+                                            let height = 800u16;
+                                            let stride = width;
+
+                                            let video_frame = VideoFrame {
+                                                sensor_index,
+                                                timestamp_ns: (stream_header.ll_nanoseconds as i64
+                                                    + time_offset_ns)
+                                                    as u64,
+                                                arrival_timestamp_ns: (stream_header
+                                                    .ll_arrival_nanoseconds
+                                                    as i64
+                                                    + time_offset_ns)
+                                                    as u64,
+                                                frame_id: stream_header.dw_frame_id,
+                                                width,
+                                                height,
+                                                stride,
+                                                exposure_time_us: metadata.dw_exposuretime,
+                                                gain: metadata.f_gain,
+                                                data: frame_data,
+                                            };
+
+                                            if tx.send(video_frame).is_err() {
+                                                eprintln!(
+                                                    "Device {} video receiver dropped, stopping",
+                                                    device_id
+                                                );
+                                                break;
+                                            }
+                                        }
+                                    }
+                                }
+                            }
+                            DEV_STATUS => {
+                                if size >= 8 {
+                                    let status_msg: InterruptMessageStatus =
+                                        bytemuck::pod_read_unaligned(&buffer[..8]);
+                                    if status_msg.w_status == DEVICE_STOPPED {
+                                        if video_streaming.load(Ordering::SeqCst) {
+                                            eprintln!(
+                                                "Device {} received stale video STOPPED message, ignoring",
+                                                device_id
+                                            );
+                                        } else {
+                                            eprintln!("Device {} video stream stopped", device_id);
+                                            break;
+                                        }
+                                    }
+                                }
+                            }
+                            _ => {
+                                eprintln!("Unknown message: {msg_id}");
+                            }
+                        }
+                    }
+                    Ok(_) => {
+                        // short read, continue
+                    }
+                    Err(rusb::Error::Timeout) => {
+                        eprintln!("timeout");
+                    }
+                    Err(e) => {
+                        eprintln!("Device {} video stream error: {}", device_id, e);
+                        break;
+                    }
+                }
+            }
+
+            video_streaming.store(false, Ordering::SeqCst);
+        });
+
+        Ok(rx)
+    }
+
+    pub(crate) fn stop_video_stream(&self) -> Result<()> {
+        if !self.video_streaming.load(Ordering::SeqCst) {
+            return Ok(());
+        }
+        self.video_streaming.store(false, Ordering::SeqCst);
+        std::thread::sleep(std::time::Duration::from_millis(200));
+
+        // If pose stream is not running, stop device streaming
+        // (video stream started it, so video stream should stop it)
+        if !self.pose_streaming.load(Ordering::SeqCst) {
+            self.stop_streaming()?;
+        }
+
+        Ok(())
+    }
 }
 
-/// wont take ownership of self
 fn convert_pose_data_static(data: &PoseData, time_offset_ns: i64, device_id: &str) -> Pose {
     Pose {
         translation: [data.fl_x, data.fl_y, data.fl_z],

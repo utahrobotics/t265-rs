@@ -1,6 +1,7 @@
 /target/
 **/*.rs.bk
 *.pdb
+*.pgm
 Cargo.lock
 
 .vscode/

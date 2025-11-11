@@ -17,14 +17,13 @@ fn main() -> Result<()> {
 
     let device_id = &devices[0];
 
-    let device = manager.get_device_mut(device_id).unwrap();
-    device.sync_time()?;
-
-    device.enable_6dof(t265_rs::SIXDOF_MODE_NORMAL)?;
-
-    device.start_streaming()?;
+    // Start device for synchronous pose reading
+    manager.start_device_for_sync_read(device_id, t265_rs::SIXDOF_MODE_NORMAL)?;
 
     println!("\nReading 10 poses:\n");
+
+    // Get device reference for read_pose()
+    let device = manager.get_device_by_id(device_id).unwrap();
 
     for i in 0..10 {
         match device.read_pose() {
@@ -53,7 +52,7 @@ fn main() -> Result<()> {
     }
 
     println!("Stopping streaming...");
-    device.stop_streaming()?;
+    manager.stop_device_sync_read(device_id)?;
 
     println!("Done!");
 

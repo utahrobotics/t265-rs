@@ -1,7 +1,6 @@
 use crate::error::{Error, Result};
 use rusb::{DeviceHandle, GlobalContext};
 use sha1::{Digest, Sha1};
-use std::io::Write;
 use std::time::Duration;
 
 const FIRMWARE_VERSION: &str = "0.2.0.951";
@@ -40,12 +39,12 @@ pub fn upload_firmware(handle: &DeviceHandle<GlobalContext>) -> Result<()> {
     println!("\nUploading firmware to device...");
 
     const CHUNK_SIZE: usize = 64 * 1024;
-    let mut transferred = 0;
+    let mut _transferred = 0;
 
     for chunk in firmware.chunks(CHUNK_SIZE) {
         match handle.write_bulk(BOOTLOADER_ENDPOINT_OUT, chunk, Duration::from_secs(5)) {
             Ok(n) => {
-                transferred += n;
+                _transferred += n;
             }
             Err(e) => {
                 return Err(Error::Usb(e));

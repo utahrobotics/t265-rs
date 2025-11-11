@@ -2,7 +2,10 @@ use crate::device::T265Device;
 use crate::error::{Error, Result};
 use crate::firmware;
 use crate::pose::Pose;
-use crate::protocol::{T265_BOOT_PID, T265_BOOT_VID, T265_PID, T265_VID};
+use crate::protocol::{
+    SupportedRawStreamMessage, T265_BOOT_PID, T265_BOOT_VID, T265_PID, T265_VID,
+};
+use crate::video::VideoFrame;
 use rusb::{GlobalContext, UsbContext};
 use std::sync::mpsc;
 
@@ -138,7 +141,8 @@ impl T265Manager {
         &mut self.devices
     }
 
-    pub fn start_all_devices(&mut self) -> Result<mpsc::Receiver<Pose>> {
+    /// Start Pose stream for all devices
+    pub fn start_all_pose_streams(&mut self) -> Result<mpsc::Receiver<Pose>> {
         let (tx, rx) = mpsc::channel();
 
         for device in &mut self.devices {
@@ -152,16 +156,151 @@ impl T265Manager {
         Ok(rx)
     }
 
-    pub fn stop_all_devices(&mut self) -> Result<()> {
+    pub fn stop_all_pose_streams(&mut self) -> Result<()> {
         for device in &mut self.devices {
             device.stop_pose_stream()?;
         }
+        Ok(())
+    }
+
+    /// Returns a map of device_id -> supported streams
+    pub fn get_supported_video_streams(
+        &self,
+    ) -> Result<std::collections::HashMap<String, Vec<SupportedRawStreamMessage>>> {
+        let mut result = std::collections::HashMap::new();
+        for device in &self.devices {
+            let streams = device.get_supported_video_streams()?;
+            result.insert(device.device_id().to_string(), streams);
+        }
+        Ok(result)
+    }
+
+    /// Enable video streams on a specific device
+    pub fn enable_video_streams(
+        &self,
+        device_id: &str,
+        // the supported raw stream message type can be found from the get_supported_video_streams() function
+        streams: &[SupportedRawStreamMessage],
+    ) -> Result<()> {
+        let device = self.get_device(device_id).ok_or(Error::DeviceNotFound)?;
+        device.enable_video_streams(streams)
+    }
+
+    /// Enable all video streams on all devices
+    pub fn enable_all_video_streams(&self) -> Result<()> {
+        for device in &self.devices {
+            let streams = device.get_supported_video_streams()?;
+
+            let mut fisheye_streams: Vec<_> = streams
+                .into_iter()
+                .filter(|stream| {
+                    let sensor_type = crate::protocol::get_sensor_type(stream.b_sensor_id);
+                    sensor_type == crate::protocol::SENSOR_TYPE_FISHEYE
+                })
+                .collect();
+
+            for stream in &mut fisheye_streams {
+                stream.b_output_mode = 1;
+            }
+
+            device.enable_video_streams(&fisheye_streams)?;
+        }
+        Ok(())
+    }
+
+    pub fn start_video_stream(&self, device_id: &str) -> Result<mpsc::Receiver<VideoFrame>> {
+        let device = self.get_device(device_id).ok_or(Error::DeviceNotFound)?;
+        device.start_video_stream()
+    }
+
+    pub fn start_all_video_streams(&self) -> Result<mpsc::Receiver<(String, VideoFrame)>> {
+        let (tx, rx) = mpsc::channel();
+
+        for device in &self.devices {
+            let device_rx = device.start_video_stream()?;
+            let device_id = device.device_id().to_string();
+            let tx_clone = tx.clone();
+
+            std::thread::spawn(move || {
+                while let Ok(frame) = device_rx.recv() {
+                    if tx_clone.send((device_id.clone(), frame)).is_err() {
+                        break;
+                    }
+                }
+            });
+        }
+
+        Ok(rx)
+    }
+
+    /// Stop video streaming on a specific device
+    pub fn stop_video_stream(&self, device_id: &str) -> Result<()> {
+        let device = self.get_device(device_id).ok_or(Error::DeviceNotFound)?;
+        device.stop_video_stream()
+    }
+
+    /// Stop video streaming on all devices
+    pub fn stop_all_video_streams(&self) -> Result<()> {
+        for device in &self.devices {
+            device.stop_video_stream()?;
+        }
+        Ok(())
+    }
+
+    /// Set the 6DOF mode for a specific device. Must be called before starting pose stream.
+    /// possible modes:
+    /// ```rust
+    /// pub const SIXDOF_MODE_NORMAL: u8 = 0x00;
+    /// pub const SIXDOF_MODE_ENABLE_MAPPING: u8 = 0x02;
+    /// pub const SIXDOF_MODE_ENABLE_RELOCALIZATION: u8 = 0x04;
+    /// pub const SIXDOF_MODE_DISABLE_JUMPING: u8 = 0x08;
+    /// ```
+    pub fn set_device_mode(&mut self, device_id: &str, mode: u8) -> Result<()> {
+        let device = self
+            .get_device_mut(device_id)
+            .ok_or(Error::DeviceNotFound)?;
+        device.set_mode(mode);
+        Ok(())
+    }
+
+    /// Set the 6DOF mode for all devices. Must be called before starting pose stream.
+    pub fn set_all_device_modes(&mut self, mode: u8) -> Result<()> {
+        for device in &mut self.devices {
+            device.set_mode(mode);
+        }
+        Ok(())
+    }
+
+    pub fn get_device_by_id(&self, device_id: &str) -> Option<&T265Device> {
+        self.get_device(device_id)
+    }
+
+    pub fn get_device_by_id_mut(&mut self, device_id: &str) -> Option<&mut T265Device> {
+        self.get_device_mut(device_id)
+    }
+
+    pub fn start_device_for_sync_read(&mut self, device_id: &str, mode: u8) -> Result<()> {
+        let device = self
+            .get_device_mut(device_id)
+            .ok_or(Error::DeviceNotFound)?;
+        device.sync_time()?;
+        device.enable_6dof(mode)?;
+        device.start_streaming()?;
+        Ok(())
+    }
+
+    pub fn stop_device_sync_read(&mut self, device_id: &str) -> Result<()> {
+        let device = self
+            .get_device_mut(device_id)
+            .ok_or(Error::DeviceNotFound)?;
+        device.stop_streaming()?;
         Ok(())
     }
 }
 
 impl Drop for T265Manager {
     fn drop(&mut self) {
-        let _ = self.stop_all_devices();
+        let _ = self.stop_all_pose_streams();
+        let _ = self.stop_all_video_streams();
     }
 }
