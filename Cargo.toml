@@ -1,0 +1,10 @@
+[package]
+name = "t265-rs"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+rusb = "0.9"
+bytemuck = { version = "1.14", features = ["derive"] }
+thiserror = "1.0"
+sha1 = "0.10"
