@@ -258,20 +258,6 @@ impl T265Device {
     }
 
     fn convert_pose_data(&self, data: &PoseData) -> Pose {
-        // Debug: print raw mapper confidence occasionally
-        static mut COUNTER: u32 = 0;
-        unsafe {
-            COUNTER += 1;
-            if COUNTER % 100 == 0 {
-                let mapper_conf = data.dw_mapper_confidence;
-                let tracker_conf = data.dw_tracker_confidence;
-                eprintln!(
-                    "DEBUG: Raw mapper_confidence = {:#x} ({}) | tracker_confidence = {:#x} ({})",
-                    mapper_conf, mapper_conf, tracker_conf, tracker_conf
-                );
-            }
-        }
-
         Pose {
             translation: [data.fl_x, data.fl_y, data.fl_z],
             rotation: [data.fl_qi, data.fl_qj, data.fl_qk, data.fl_qr],
@@ -398,26 +384,14 @@ impl T265Device {
 
     pub fn stop_pose_stream(&mut self) -> Result<()> {
         self.running.store(false, Ordering::SeqCst);
-        // Give the thread more time to exit (it may be blocking on read_interrupt with 1000ms timeout)
         std::thread::sleep(std::time::Duration::from_millis(200));
         self.stop_streaming()?;
         Ok(())
     }
 }
 
+/// wont take ownership of self
 fn convert_pose_data_static(data: &PoseData, time_offset_ns: i64, device_id: &str) -> Pose {
-    // Debug: print raw mapper confidence occasionally
-    static COUNTER: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
-    let count = COUNTER.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-    if count % 100 == 0 {
-        let mapper_conf = data.dw_mapper_confidence;
-        let tracker_conf = data.dw_tracker_confidence;
-        eprintln!(
-            "DEBUG [{}]: Raw mapper_confidence = {:#x} ({}) | tracker_confidence = {:#x} ({})",
-            device_id, mapper_conf, mapper_conf, tracker_conf, tracker_conf
-        );
-    }
-
     Pose {
         translation: [data.fl_x, data.fl_y, data.fl_z],
         rotation: [data.fl_qi, data.fl_qj, data.fl_qk, data.fl_qr],
@@ -427,7 +401,7 @@ fn convert_pose_data_static(data: &PoseData, time_offset_ns: i64, device_id: &st
         angular_acceleration: [data.fl_aax, data.fl_aay, data.fl_aaz],
         timestamp_ns: (data.ll_nanoseconds as i64 + time_offset_ns) as u64,
         tracker_confidence: Confidence::from(data.dw_tracker_confidence),
-        mapper_confidence: Confidence::from(data.dw_mapper_confidence), // Use raw value like librealsense
+        mapper_confidence: Confidence::from(data.dw_mapper_confidence),
         tracker_state: TrackerState::from(data.dw_tracker_state),
         device_id: device_id.to_string(),
     }
