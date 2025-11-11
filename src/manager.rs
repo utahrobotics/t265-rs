@@ -141,6 +141,18 @@ impl T265Manager {
         &mut self.devices
     }
 
+    /// Start Pose stream for a specific device
+    pub fn start_pose_stream(&mut self, device_id: &str) -> Result<mpsc::Receiver<Pose>> {
+        let device = self
+            .get_device_mut(device_id)
+            .ok_or(Error::DeviceNotFound)?;
+        device.sync_time()?;
+        
+        let (tx, rx) = mpsc::channel();
+        device.start_pose_stream(tx)?;
+        Ok(rx)
+    }
+
     /// Start Pose stream for all devices
     pub fn start_all_pose_streams(&mut self) -> Result<mpsc::Receiver<Pose>> {
         let (tx, rx) = mpsc::channel();
@@ -154,6 +166,14 @@ impl T265Manager {
         }
 
         Ok(rx)
+    }
+
+    /// Stop pose streaming on a specific device
+    pub fn stop_pose_stream(&mut self, device_id: &str) -> Result<()> {
+        let device = self
+            .get_device_mut(device_id)
+            .ok_or(Error::DeviceNotFound)?;
+        device.stop_pose_stream()
     }
 
     pub fn stop_all_pose_streams(&mut self) -> Result<()> {
