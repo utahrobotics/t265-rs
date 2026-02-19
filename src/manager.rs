@@ -98,35 +98,6 @@ impl T265Manager {
         Ok(device_ids)
     }
 
-    pub fn open_device(&mut self, device_id: &str) -> Result<()> {
-        for device in self.context.devices()?.iter() {
-            let device_desc = device.device_descriptor()?;
-
-            if device_desc.vendor_id() == T265_VID && device_desc.product_id() == T265_PID {
-                let handle = device.open()?;
-
-                let timeout = std::time::Duration::from_secs(1);
-                let languages = handle.read_languages(timeout)?;
-                let serial = if let Some(lang) = languages.first() {
-                    handle
-                        .read_serial_number_string(*lang, &device_desc, timeout)
-                        .unwrap_or_else(|_| format!("unknown_{}", self.devices.len()))
-                } else {
-                    format!("unknown_{}", self.devices.len())
-                };
-
-                if serial == device_id {
-                    handle.claim_interface(0)?;
-                    let t265_device = T265Device::new(handle, device_id.to_string());
-                    self.devices.push(t265_device);
-                    return Ok(());
-                }
-            }
-        }
-
-        Err(Error::DeviceNotFound)
-    }
-
     pub fn get_device(&self, device_id: &str) -> Option<&T265Device> {
         self.devices.iter().find(|d| d.device_id() == device_id)
     }
@@ -143,6 +114,18 @@ impl T265Manager {
         &mut self.devices
     }
 
+    /// Start Pose stream for a specific device
+    pub fn start_pose_stream(&mut self, device_id: &str) -> Result<mpsc::Receiver<Pose>> {
+        let device = self
+            .get_device_mut(device_id)
+            .ok_or(Error::DeviceNotFound)?;
+        device.sync_time()?;
+        
+        let (tx, rx) = mpsc::channel();
+        device.start_pose_stream(tx)?;
+        Ok(rx)
+    }
+
     /// Start Pose stream for all devices
     pub fn start_all_pose_streams(&mut self) -> Result<mpsc::Receiver<Pose>> {
         let (tx, rx) = mpsc::channel();
@@ -156,6 +139,14 @@ impl T265Manager {
         }
 
         Ok(rx)
+    }
+
+    /// Stop pose streaming on a specific device
+    pub fn stop_pose_stream(&mut self, device_id: &str) -> Result<()> {
+        let device = self
+            .get_device_mut(device_id)
+            .ok_or(Error::DeviceNotFound)?;
+        device.stop_pose_stream()
     }
 
     pub fn stop_all_pose_streams(&mut self) -> Result<()> {
