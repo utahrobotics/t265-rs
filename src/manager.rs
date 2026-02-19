@@ -1,10 +1,12 @@
 use crate::device::T265Device;
 use crate::error::{Error, Result};
 use crate::firmware;
+use crate::imu::ImuFrame;
 use crate::pose::Pose;
 use crate::protocol::{
     SupportedRawStreamMessage, T265_BOOT_PID, T265_BOOT_VID, T265_PID, T265_VID,
 };
+use crate::temperature::{SensorTemperature, TempSensor};
 use crate::video::VideoFrame;
 use rusb::{GlobalContext, UsbContext};
 use std::sync::mpsc;
@@ -295,6 +297,78 @@ impl T265Manager {
             .ok_or(Error::DeviceNotFound)?;
         device.stop_streaming()?;
         Ok(())
+    }
+
+    /// Enable IMU (gyro + accelerometer) streams on a specific device.
+    ///
+    /// Must be called **before** starting the pose stream so the streams are
+    /// activated prior to `DEV_START`.
+    pub fn enable_imu_streams(&self, device_id: &str) -> Result<()> {
+        let device = self.get_device(device_id).ok_or(Error::DeviceNotFound)?;
+        device.enable_imu_streams()
+    }
+
+    /// Enable IMU streams on all devices.
+    pub fn enable_all_imu_streams(&self) -> Result<()> {
+        for device in &self.devices {
+            device.enable_imu_streams()?;
+        }
+        Ok(())
+    }
+
+    /// Enable IMU streams and return a receiver for a specific device.
+    ///
+    /// Call this before `start_all_pose_streams` / `start_pose_stream`.
+    /// The interrupt thread started by those methods will forward both
+    /// pose and IMU frames on their respective channels.
+    pub fn start_imu_stream(&self, device_id: &str) -> Result<mpsc::Receiver<ImuFrame>> {
+        let device = self.get_device(device_id).ok_or(Error::DeviceNotFound)?;
+        device.start_imu_stream()
+    }
+
+    /// Enable IMU streams on all devices and return a merged receiver.
+    ///
+    /// Call this before `start_all_pose_streams`.
+    pub fn start_all_imu_streams(&self) -> Result<mpsc::Receiver<ImuFrame>> {
+        let (tx, rx) = mpsc::channel();
+
+        for device in &self.devices {
+            let device_rx = device.start_imu_stream()?;
+            let tx_clone = tx.clone();
+            std::thread::spawn(move || {
+                while let Ok(frame) = device_rx.recv() {
+                    if tx_clone.send(frame).is_err() {
+                        break;
+                    }
+                }
+            });
+        }
+
+        Ok(rx)
+    }
+
+    /// Query all temperature sensors on a specific device.
+    ///
+    /// Returns a `Vec<SensorTemperature>` with one entry per sensor (VPU, IMU, BLE).
+    pub fn get_temperature(&self, device_id: &str) -> Result<Vec<SensorTemperature>> {
+        let device = self.get_device(device_id).ok_or(Error::DeviceNotFound)?;
+        device.get_temperature()
+    }
+
+    /// Set the temperature threshold for a single sensor on a specific device.
+    ///
+    /// Pass `force_token = 0` for thresholds in the normal range (< 80 °C).
+    /// For thresholds between 80–100 °C, use the `threshold_c` value returned
+    /// by `get_temperature` as the force token (firmware-enforced safety gate).
+    pub fn set_temperature_threshold(
+        &self,
+        device_id: &str,
+        sensor: TempSensor,
+        threshold_c: f32,
+        force_token: u16,
+    ) -> Result<()> {
+        let device = self.get_device(device_id).ok_or(Error::DeviceNotFound)?;
+        device.set_temperature_threshold(sensor, threshold_c, force_token)
     }
 }
 

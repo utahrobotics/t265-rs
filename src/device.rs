@@ -1,11 +1,13 @@
 use crate::error::{Error, Result};
+use crate::imu::{ImuFrame, ImuKind, ImuSample};
 use crate::pose::{Confidence, Pose, TrackerState};
 use crate::protocol::*;
+use crate::temperature::{SensorTemperature, TempSensor};
 use crate::video::VideoFrame;
 use rusb::{DeviceHandle, GlobalContext};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 use std::time::Instant;
 
 pub struct T265Device {
@@ -15,6 +17,9 @@ pub struct T265Device {
     pose_streaming: Arc<AtomicBool>,
     current_mode: u8,
     video_streaming: Arc<AtomicBool>,
+    /// Shared with the interrupt thread so IMU frames can be forwarded even after
+    /// the thread is running.  Set by `start_imu_stream`, cleared on drop.
+    imu_tx: Arc<Mutex<Option<mpsc::Sender<ImuFrame>>>>,
 }
 
 impl T265Device {
@@ -26,6 +31,7 @@ impl T265Device {
             pose_streaming: Arc::new(AtomicBool::new(false)),
             current_mode: SIXDOF_MODE_ENABLE_MAPPING | SIXDOF_MODE_ENABLE_RELOCALIZATION,
             video_streaming: Arc::new(AtomicBool::new(false)),
+            imu_tx: Arc::new(Mutex::new(None)),
         }
     }
 
@@ -160,7 +166,7 @@ impl T265Device {
     }
 
     pub fn read_pose(&self) -> Result<Pose> {
-        let mut buffer = vec![0u8; 128];
+        let mut buffer = vec![0u8; 1024]; // librealsense uses BUFFER_SIZE = 1024
 
         loop {
             let size =
@@ -249,6 +255,12 @@ impl T265Device {
                     }
                     continue;
                 }
+                // IMU samples arrive on the interrupt endpoint when IMU streams are
+                // enabled.  read_pose has no channel to forward them through, so
+                // we skip them silently.
+                DEV_SAMPLE => {
+                    continue;
+                }
                 _ => {
                     let msg_id = header.w_message_id;
                     eprintln!(
@@ -285,10 +297,11 @@ impl T265Device {
         let device_id = self.device_id.clone();
         let time_offset = self.time_offset_ns;
         let pose_streaming = Arc::clone(&self.pose_streaming);
+        let imu_tx = Arc::clone(&self.imu_tx);
         pose_streaming.store(true, Ordering::SeqCst);
 
         std::thread::spawn(move || {
-            let mut buffer = vec![0u8; 128];
+            let mut buffer = vec![0u8; 1024]; // librealsense uses BUFFER_SIZE = 1024
 
             while pose_streaming.load(Ordering::SeqCst) {
                 match handle.read_interrupt(
@@ -313,6 +326,50 @@ impl T265Device {
                                     convert_pose_data_static(&msg.pose, time_offset, &device_id);
                                 if tx.send(pose).is_err() {
                                     break;
+                                }
+                            }
+                            DEV_SAMPLE
+                                if size
+                                    >= std::mem::size_of::<InterruptMessageImuStream>() =>
+                            {
+                                let imu_msg: InterruptMessageImuStream =
+                                    bytemuck::pod_read_unaligned(
+                                        &buffer[..std::mem::size_of::<InterruptMessageImuStream>()],
+                                    );
+                                let sensor_type =
+                                    get_sensor_type(imu_msg.raw_stream_header.b_sensor_id);
+                                let kind = match sensor_type {
+                                    SENSOR_TYPE_ACCELEROMETER => ImuKind::Accel,
+                                    SENSOR_TYPE_GYRO => ImuKind::Gyro,
+                                    _ => {
+                                        eprintln!(
+                                            "Device {} unknown DEV_SAMPLE sensor type: {}",
+                                            device_id, sensor_type
+                                        );
+                                        continue;
+                                    }
+                                };
+                                if let Ok(guard) = imu_tx.lock() {
+                                    if let Some(ref sender) = *guard {
+                                        let sample = ImuSample {
+                                            sensor_index: get_sensor_index(
+                                                imu_msg.raw_stream_header.b_sensor_id,
+                                            ),
+                                            timestamp_ns: (imu_msg
+                                                .raw_stream_header
+                                                .ll_nanoseconds
+                                                as i64
+                                                + time_offset)
+                                                as u64,
+                                            frame_id: imu_msg.raw_stream_header.dw_frame_id,
+                                            temperature: imu_msg.metadata.fl_temperature,
+                                            x: imu_msg.metadata.fl_x,
+                                            y: imu_msg.metadata.fl_y,
+                                            z: imu_msg.metadata.fl_z,
+                                            device_id: device_id.clone(),
+                                        };
+                                        let _ = sender.send(ImuFrame { kind, sample });
+                                    }
                                 }
                             }
                             DEV_ERROR if size >= 8 => {
@@ -387,6 +444,192 @@ impl T265Device {
         self.pose_streaming.store(false, Ordering::SeqCst);
         std::thread::sleep(std::time::Duration::from_millis(200));
         self.stop_streaming()?;
+        Ok(())
+    }
+
+    /// Enable IMU (gyroscope + accelerometer) raw streams on the device.
+    ///
+    /// Must be called **before** `start_streaming` / `start_pose_stream` so the
+    /// device includes IMU samples in its interrupt output.  Call
+    /// `start_imu_stream` which wraps this automatically.
+    ///
+    /// Mirrors librealsense `tm2_sensor::open()` exactly:
+    /// 1. Fetch all supported streams.
+    /// 2. Drop duplicate IMU FPS entries (keep gyro@200 Hz, accel@62 Hz only) —
+    ///    sending multiple entries for the same sensor is `INVALID_PARAMETER`.
+    /// 3. Set ALL entries to `bOutputMode = 0`, then enable IMU ones to 1.
+    /// 4. Send the entire filtered list via `DEV_RAW_STREAMS_CONTROL`.
+    pub(crate) fn enable_imu_streams(&self) -> Result<()> {
+        let raw = self.get_supported_video_streams()?;
+
+        // librealsense filters IMU streams by the only supported FPS.
+        // Sending multiple entries for the same sensor type causes INVALID_PARAMETER.
+        let mut streams: Vec<SupportedRawStreamMessage> = raw
+            .into_iter()
+            .filter(|s| {
+                let t = get_sensor_type(s.b_sensor_id);
+                match t {
+                    SENSOR_TYPE_GYRO => s.w_frames_per_second == 200,
+                    SENSOR_TYPE_ACCELEROMETER => s.w_frames_per_second == 62,
+                    _ => true, // keep fisheye / other entries
+                }
+            })
+            .collect();
+
+        let has_imu = streams.iter().any(|s| {
+            let t = get_sensor_type(s.b_sensor_id);
+            t == SENSOR_TYPE_GYRO || t == SENSOR_TYPE_ACCELEROMETER
+        });
+
+        if !has_imu {
+            return Err(Error::Protocol(
+                "Device reports no IMU streams at the expected sample rates (gyro=200 Hz, accel=62 Hz)".to_string(),
+            ));
+        }
+
+        // bOutputMode/bReserved2 from GET response is always 0 (reserved from device).
+        // Set to 1 for IMU sensors we want forwarded to host; leave others at 0.
+        for s in &mut streams {
+            let t = get_sensor_type(s.b_sensor_id);
+            s.b_output_mode = u8::from(t == SENSOR_TYPE_GYRO || t == SENSOR_TYPE_ACCELEROMETER);
+        }
+
+        self.enable_video_streams(&streams)
+    }
+
+    /// Enable IMU streams and return a receiver that yields `ImuFrame` values.
+    ///
+    /// This registers a sender that the interrupt-endpoint thread (started by
+    /// `start_pose_stream`) will use to forward accelerometer and gyroscope
+    /// samples.  Call this **before** `start_pose_stream` so the streams are
+    /// enabled prior to `DEV_START`.
+    pub(crate) fn start_imu_stream(&self) -> Result<mpsc::Receiver<ImuFrame>> {
+        self.enable_imu_streams()?;
+
+        let (tx, rx) = mpsc::channel();
+        *self.imu_tx.lock().unwrap() = Some(tx);
+        Ok(rx)
+    }
+
+    /// Query all three temperature sensors (VPU, IMU, BLE) in one USB round-trip.
+    ///
+    /// Can be called at any time — the device does not need to be streaming.
+    pub fn get_temperature(&self) -> Result<Vec<SensorTemperature>> {
+        let req = BulkMessageRequestGetTemperature {
+            header: BulkMessageRequestHeader {
+                dw_length: std::mem::size_of::<BulkMessageRequestGetTemperature>() as u32,
+                w_message_id: DEV_GET_TEMPERATURE,
+            },
+        };
+
+        let req_bytes = bytemuck::bytes_of(&req);
+        self.handle
+            .write_bulk(ENDPOINT_CONTROL_OUT, req_bytes, USB_TIMEOUT)?;
+
+        let mut buffer = vec![0u8; 1024];
+        let bytes_read = self
+            .handle
+            .read_bulk(ENDPOINT_CONTROL_IN, &mut buffer, USB_TIMEOUT)?;
+
+        let header_size = std::mem::size_of::<BulkMessageResponseGetTemperatureHeader>();
+        if bytes_read < header_size {
+            return Err(Error::MessageTooShort {
+                expected: header_size,
+                actual: bytes_read,
+            });
+        }
+
+        let response: BulkMessageResponseGetTemperatureHeader =
+            bytemuck::pod_read_unaligned(&buffer[..header_size]);
+
+        if response.header.w_status != SUCCESS {
+            return Err(Error::from_status(response.header.w_status));
+        }
+
+        let count = response.dw_count as usize;
+        let entry_size = std::mem::size_of::<SensorTemperatureEntry>();
+        let mut temps = Vec::with_capacity(count);
+
+        for i in 0..count {
+            let offset = header_size + i * entry_size;
+            if offset + entry_size > bytes_read {
+                break;
+            }
+            let entry: SensorTemperatureEntry =
+                bytemuck::pod_read_unaligned(&buffer[offset..offset + entry_size]);
+            if let Some(sensor) = TempSensor::from_index(entry.dw_index) {
+                temps.push(SensorTemperature {
+                    sensor,
+                    temperature_c: entry.f_temperature,
+                    threshold_c: entry.f_threshold,
+                });
+            }
+        }
+
+        Ok(temps)
+    }
+
+    /// Set the temperature threshold for a single sensor.
+    ///
+    /// The device sends `TEMPERATURE_WARNING` when temperature reaches 90% of
+    /// the threshold, and stops all streaming when the threshold is reached.
+    ///
+    /// For thresholds between 80 °C and 100 °C pass the firmware-supplied
+    /// `force_token` (obtained from the current `threshold_c` response field);
+    /// for normal operation pass `0`.
+    pub fn set_temperature_threshold(
+        &self,
+        sensor: TempSensor,
+        threshold_c: f32,
+        force_token: u16,
+    ) -> Result<()> {
+        let entry = SensorSetTemperatureEntry {
+            dw_index: sensor as u32,
+            f_threshold: threshold_c,
+        };
+
+        let header_size =
+            std::mem::size_of::<BulkMessageRequestSetTemperatureThresholdHeader>();
+        let entry_size = std::mem::size_of::<SensorSetTemperatureEntry>();
+        let total_size = header_size + entry_size;
+
+        let mut buffer = vec![0u8; total_size];
+
+        let request_header = BulkMessageRequestSetTemperatureThresholdHeader {
+            header: BulkMessageRequestHeader {
+                dw_length: total_size as u32,
+                w_message_id: DEV_SET_TEMPERATURE_THRESHOLD,
+            },
+            w_force_token: force_token,
+            dw_count: 1,
+        };
+
+        buffer[..header_size].copy_from_slice(bytemuck::bytes_of(&request_header));
+        buffer[header_size..total_size].copy_from_slice(bytemuck::bytes_of(&entry));
+
+        self.handle
+            .write_bulk(ENDPOINT_CONTROL_OUT, &buffer, USB_TIMEOUT)?;
+
+        let mut resp_buffer = vec![0u8; 64];
+        let bytes_read = self
+            .handle
+            .read_bulk(ENDPOINT_CONTROL_IN, &mut resp_buffer, USB_TIMEOUT)?;
+
+        let resp_size = std::mem::size_of::<BulkMessageResponseSetTemperatureThreshold>();
+        if bytes_read < resp_size {
+            return Err(Error::MessageTooShort {
+                expected: resp_size,
+                actual: bytes_read,
+            });
+        }
+
+        let response: BulkMessageResponseSetTemperatureThreshold =
+            bytemuck::pod_read_unaligned(&resp_buffer[..resp_size]);
+
+        if response.header.w_status != SUCCESS {
+            return Err(Error::from_status(response.header.w_status));
+        }
+
         Ok(())
     }
 

@@ -26,6 +26,8 @@ pub const DEV_STATUS: u16 = 0x0014;
 pub const DEV_GET_POSE: u16 = 0x0015;
 #[allow(dead_code)]
 pub const DEV_SAMPLE: u16 = 0x0011;
+pub const DEV_GET_TEMPERATURE: u16 = 0x0018;
+pub const DEV_SET_TEMPERATURE_THRESHOLD: u16 = 0x0019;
 pub const SLAM_SET_6DOF_INTERRUPT_RATE: u16 = 0x1005;
 pub const SLAM_6DOF_CONTROL: u16 = 0x1006;
 #[allow(dead_code)]
@@ -48,6 +50,8 @@ pub const DEVICE_BUSY: u16 = 0x0008;
 pub const TIMEOUT: u16 = 0x000B;
 pub const DEVICE_STOPPED: u16 = 0x000C;
 pub const TEMPERATURE_WARNING: u16 = 0x0010;
+#[allow(dead_code)]
+pub const TEMPERATURE_STOP: u16 = 0x0011;
 
 /// Convert a T265 status code to a human-readable error message
 pub fn status_to_string(status: u16) -> &'static str {
@@ -256,6 +260,42 @@ pub fn get_sensor_index(sensor_id: u8) -> u8 {
     (sensor_id & 0xE0) >> 5
 }
 
+/// Interrupt raw stream header - common header for IMU samples on endpoint 0x83.
+/// Follows the 6-byte InterruptMessageHeader when wMessageID == DEV_SAMPLE.
+/// Total: 28 bytes.
+#[repr(C, packed)]
+#[derive(Copy, Clone, Debug, Pod, Zeroable)]
+pub struct InterruptMessageRawStreamHeader {
+    pub header: InterruptMessageHeader,    // 6 bytes
+    pub b_sensor_id: u8,                   // 1 byte: bits 0-4 = type, bits 5-7 = index
+    pub b_reserved: u8,                    // 1 byte
+    pub ll_nanoseconds: u64,               // 8 bytes: device timestamp
+    pub ll_arrival_nanoseconds: u64,       // 8 bytes: arrival timestamp
+    pub dw_frame_id: u32,                  // 4 bytes: running counter per sensor
+}
+
+/// Metadata payload for an accelerometer or gyroscope interrupt sample.
+/// Total: 24 bytes.
+#[repr(C, packed)]
+#[derive(Copy, Clone, Debug, Pod, Zeroable)]
+pub struct InterruptMessageImuStreamMetadata {
+    pub dw_metadata_length: u32,   // 4 bytes (always 4)
+    pub fl_temperature: f32,        // 4 bytes: degrees Celsius
+    pub dw_frame_length: u32,      // 4 bytes (always 12)
+    pub fl_x: f32,                  // 4 bytes: accel m/s² or gyro rad/s on X
+    pub fl_y: f32,                  // 4 bytes: accel m/s² or gyro rad/s on Y
+    pub fl_z: f32,                  // 4 bytes: accel m/s² or gyro rad/s on Z
+}
+
+/// Complete interrupt IMU stream message (accelerometer or gyroscope).
+/// Total: 52 bytes (28 header + 24 metadata).
+#[repr(C, packed)]
+#[derive(Copy, Clone, Debug, Pod, Zeroable)]
+pub struct InterruptMessageImuStream {
+    pub raw_stream_header: InterruptMessageRawStreamHeader, // 28 bytes
+    pub metadata: InterruptMessageImuStreamMetadata,        // 24 bytes
+}
+
 // Video stream structures
 #[repr(C, packed)]
 #[derive(Copy, Clone, Debug, Pod, Zeroable)]
@@ -321,5 +361,60 @@ pub struct BulkMessageRequestRawStreamsControlHeader {
 #[derive(Copy, Clone, Debug, Pod, Zeroable)]
 #[allow(dead_code)]
 pub struct BulkMessageResponseRawStreamsControl {
+    pub header: BulkMessageResponseHeader,
+}
+
+// Temperature structs
+
+/// Request body for DEV_GET_TEMPERATURE (0x0018).
+/// dwLength = 6, wMessageID = DEV_GET_TEMPERATURE.
+#[repr(C, packed)]
+#[derive(Copy, Clone, Debug, Pod, Zeroable)]
+pub struct BulkMessageRequestGetTemperature {
+    pub header: BulkMessageRequestHeader,
+}
+
+/// Fixed-size header portion of the DEV_GET_TEMPERATURE response.
+/// Followed by `dw_count` × `SensorTemperatureEntry` entries.
+#[repr(C, packed)]
+#[derive(Copy, Clone, Debug, Pod, Zeroable)]
+pub struct BulkMessageResponseGetTemperatureHeader {
+    pub header: BulkMessageResponseHeader, // 8 bytes
+    pub dw_count: u32,                     // number of entries that follow
+}
+
+/// One sensor's temperature data: 12 bytes.
+/// dw_index: 0 = VPU, 1 = IMU, 2 = BLE.
+#[repr(C, packed)]
+#[derive(Copy, Clone, Debug, Pod, Zeroable)]
+pub struct SensorTemperatureEntry {
+    pub dw_index: u32,
+    pub f_temperature: f32, // Celsius
+    pub f_threshold: f32,   // threshold Celsius (device stops at this)
+}
+
+/// Fixed-size header for DEV_SET_TEMPERATURE_THRESHOLD (0x0019).
+/// Followed by `dw_count` × `SensorSetTemperatureEntry` entries.
+/// dwLength = (12 + 8 * dwCount).
+#[repr(C, packed)]
+#[derive(Copy, Clone, Debug, Pod, Zeroable)]
+pub struct BulkMessageRequestSetTemperatureThresholdHeader {
+    pub header: BulkMessageRequestHeader, // 6 bytes
+    pub w_force_token: u16,               // required when threshold is 80–100 °C
+    pub dw_count: u32,                    // number of sensor entries that follow
+}
+
+/// One sensor's new threshold: 8 bytes.
+#[repr(C, packed)]
+#[derive(Copy, Clone, Debug, Pod, Zeroable)]
+pub struct SensorSetTemperatureEntry {
+    pub dw_index: u32,
+    pub f_threshold: f32, // new threshold in Celsius
+}
+
+/// Response for DEV_SET_TEMPERATURE_THRESHOLD.
+#[repr(C, packed)]
+#[derive(Copy, Clone, Debug, Pod, Zeroable)]
+pub struct BulkMessageResponseSetTemperatureThreshold {
     pub header: BulkMessageResponseHeader,
 }

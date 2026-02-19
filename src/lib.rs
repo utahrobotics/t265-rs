@@ -1,14 +1,18 @@
 mod device;
 mod error;
 mod firmware;
+mod imu;
 mod manager;
 mod pose;
 mod protocol;
+mod temperature;
 mod video;
 
 pub use device::T265Device;
 pub use error::{Error, Result};
 pub use firmware::{get_firmware, upload_firmware};
+pub use imu::{ImuFrame, ImuKind, ImuSample};
+pub use temperature::{SensorTemperature, TempSensor};
 pub use manager::T265Manager;
 pub use pose::{Confidence, Pose, TrackerState};
 pub use protocol::{
