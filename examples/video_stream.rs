@@ -31,11 +31,10 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     let mut saved = 0;
     while saved < 10 {
-        if let Ok((device_id, frame)) = video_rx.recv_timeout(std::time::Duration::from_millis(500))
-        {
+        if let Ok(frame) = video_rx.recv_timeout(std::time::Duration::from_millis(500)) {
             let filename = format!(
                 "frames/device{}_cam{}_frame{:06}.pgm",
-                device_id, frame.sensor_index, frame.frame_id
+                frame.device_id, frame.sensor_index, frame.frame_id
             );
             if let Err(e) = save_frame_as_pgm(&frame, &filename) {
                 eprintln!("Error saving frame: {}", e);

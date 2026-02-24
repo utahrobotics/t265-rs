@@ -26,10 +26,10 @@ fn main() -> Result<()> {
             );
         }
 
-        while let Ok((device_id, frame)) = video_rx.try_recv() {
+        while let Ok(frame) = video_rx.try_recv() {
             println!(
                 "[{}] Frame: {}x{} sensor={} frame_id={}",
-                device_id, frame.width, frame.height, frame.sensor_index, frame.frame_id
+                frame.device_id, frame.width, frame.height, frame.sensor_index, frame.frame_id
             );
         }
     }

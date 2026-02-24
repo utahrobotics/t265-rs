@@ -329,8 +329,7 @@ impl T265Device {
                                 }
                             }
                             DEV_SAMPLE
-                                if size
-                                    >= std::mem::size_of::<InterruptMessageImuStream>() =>
+                                if size >= std::mem::size_of::<InterruptMessageImuStream>() =>
                             {
                                 let imu_msg: InterruptMessageImuStream =
                                     bytemuck::pod_read_unaligned(
@@ -355,9 +354,7 @@ impl T265Device {
                                             sensor_index: get_sensor_index(
                                                 imu_msg.raw_stream_header.b_sensor_id,
                                             ),
-                                            timestamp_ns: (imu_msg
-                                                .raw_stream_header
-                                                .ll_nanoseconds
+                                            timestamp_ns: (imu_msg.raw_stream_header.ll_nanoseconds
                                                 as i64
                                                 + time_offset)
                                                 as u64,
@@ -588,8 +585,7 @@ impl T265Device {
             f_threshold: threshold_c,
         };
 
-        let header_size =
-            std::mem::size_of::<BulkMessageRequestSetTemperatureThresholdHeader>();
+        let header_size = std::mem::size_of::<BulkMessageRequestSetTemperatureThresholdHeader>();
         let entry_size = std::mem::size_of::<SensorSetTemperatureEntry>();
         let total_size = header_size + entry_size;
 
@@ -611,9 +607,9 @@ impl T265Device {
             .write_bulk(ENDPOINT_CONTROL_OUT, &buffer, USB_TIMEOUT)?;
 
         let mut resp_buffer = vec![0u8; 64];
-        let bytes_read = self
-            .handle
-            .read_bulk(ENDPOINT_CONTROL_IN, &mut resp_buffer, USB_TIMEOUT)?;
+        let bytes_read =
+            self.handle
+                .read_bulk(ENDPOINT_CONTROL_IN, &mut resp_buffer, USB_TIMEOUT)?;
 
         let resp_size = std::mem::size_of::<BulkMessageResponseSetTemperatureThreshold>();
         if bytes_read < resp_size {
@@ -754,7 +750,7 @@ impl T265Device {
         std::thread::spawn(move || {
             const MAX_FRAME_SIZE: usize = 848 * 800 + 1024;
             let mut buffer = vec![0u8; MAX_FRAME_SIZE];
-
+            let device_id = device_id.clone();
             while video_streaming.load(Ordering::SeqCst) {
                 match handle.read_bulk(
                     ENDPOINT_STREAM_IN,
@@ -833,6 +829,7 @@ impl T265Device {
                                                 exposure_time_us: metadata.dw_exposuretime,
                                                 gain: metadata.f_gain,
                                                 data: frame_data,
+                                                device_id: device_id.clone(),
                                             };
 
                                             if tx.send(video_frame).is_err() {

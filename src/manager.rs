@@ -120,7 +120,7 @@ impl T265Manager {
             .get_device_mut(device_id)
             .ok_or(Error::DeviceNotFound)?;
         device.sync_time()?;
-        
+
         let (tx, rx) = mpsc::channel();
         device.start_pose_stream(tx)?;
         Ok(rx)
@@ -206,7 +206,7 @@ impl T265Manager {
         device.start_video_stream()
     }
 
-    pub fn start_all_video_streams(&self) -> Result<mpsc::Receiver<(String, VideoFrame)>> {
+    pub fn start_all_video_streams(&self) -> Result<mpsc::Receiver<VideoFrame>> {
         let (tx, rx) = mpsc::channel();
 
         for device in &self.devices {
@@ -216,7 +216,7 @@ impl T265Manager {
 
             std::thread::spawn(move || {
                 while let Ok(frame) = device_rx.recv() {
-                    if tx_clone.send((device_id.clone(), frame)).is_err() {
+                    if tx_clone.send(frame).is_err() {
                         break;
                     }
                 }

@@ -20,6 +20,7 @@ pub struct VideoFrame {
     /// Gain multiplier
     pub gain: f32,
     pub data: Vec<u8>,
+    pub device_id: String,
 }
 
 impl VideoFrame {
