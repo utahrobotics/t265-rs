@@ -1,6 +1,7 @@
 #[derive(Debug, Clone, PartialEq)]
 pub struct Pose {
     pub translation: [f32; 3],
+    /// i,j,k,r
     pub rotation: [f32; 4],
     pub velocity: [f32; 3],
     pub angular_velocity: [f32; 3],
