@@ -481,27 +481,19 @@ impl T265Device {
                 match t {
                     SENSOR_TYPE_GYRO => s.w_frames_per_second == 200,
                     SENSOR_TYPE_ACCELEROMETER => s.w_frames_per_second == 62,
-                    _ => true, // keep fisheye / other entries
+                    _ => false, // exclude fisheye; don't touch their output mode
                 }
             })
             .collect();
 
-        let has_imu = streams.iter().any(|s| {
-            let t = get_sensor_type(s.b_sensor_id);
-            t == SENSOR_TYPE_GYRO || t == SENSOR_TYPE_ACCELEROMETER
-        });
-
-        if !has_imu {
+        if streams.is_empty() {
             return Err(Error::Protocol(
                 "Device reports no IMU streams at the expected sample rates (gyro=200 Hz, accel=62 Hz)".to_string(),
             ));
         }
 
-        // bOutputMode/bReserved2 from GET response is always 0 (reserved from device).
-        // Set to 1 for IMU sensors we want forwarded to host; leave others at 0.
         for s in &mut streams {
-            let t = get_sensor_type(s.b_sensor_id);
-            s.b_output_mode = u8::from(t == SENSOR_TYPE_GYRO || t == SENSOR_TYPE_ACCELEROMETER);
+            s.b_output_mode = 1;
         }
 
         self.enable_video_streams(&streams)
