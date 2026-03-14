@@ -184,23 +184,9 @@ impl T265Manager {
     }
 
     /// Enable all video streams on all devices
-    pub fn enable_all_video_streams(&self) -> Result<()> {
-        for device in &self.devices {
-            let streams = device.get_supported_video_streams()?;
-
-            let mut fisheye_streams: Vec<_> = streams
-                .into_iter()
-                .filter(|stream| {
-                    let sensor_type = crate::protocol::get_sensor_type(stream.b_sensor_id);
-                    sensor_type == crate::protocol::SENSOR_TYPE_FISHEYE
-                })
-                .collect();
-
-            for stream in &mut fisheye_streams {
-                stream.b_output_mode = 1;
-            }
-
-            device.enable_video_streams(&fisheye_streams)?;
+    pub fn enable_all_video_streams(&mut self) -> Result<()> {
+        for device in &mut self.devices {
+            device.enable_fisheye_streams()?;
         }
         Ok(())
     }
@@ -301,14 +287,14 @@ impl T265Manager {
     ///
     /// Must be called **before** starting the pose stream so the streams are
     /// activated prior to `DEV_START`.
-    pub fn enable_imu_streams(&self, device_id: &str) -> Result<()> {
-        let device = self.get_device(device_id).ok_or(Error::DeviceNotFound)?;
+    pub fn enable_imu_streams(&mut self, device_id: &str) -> Result<()> {
+        let device = self.get_device_mut(device_id).ok_or(Error::DeviceNotFound)?;
         device.enable_imu_streams()
     }
 
     /// Enable IMU streams on all devices.
-    pub fn enable_all_imu_streams(&self) -> Result<()> {
-        for device in &self.devices {
+    pub fn enable_all_imu_streams(&mut self) -> Result<()> {
+        for device in &mut self.devices {
             device.enable_imu_streams()?;
         }
         Ok(())
@@ -320,20 +306,20 @@ impl T265Manager {
     /// The interrupt thread started by those methods will forward both
     /// pose and IMU frames on their respective channels.
     pub fn start_imu_stream(
-        &self,
+        &mut self,
         device_id: &str,
     ) -> Result<crossbeam::channel::Receiver<ImuFrame>> {
-        let device = self.get_device(device_id).ok_or(Error::DeviceNotFound)?;
+        let device = self.get_device_mut(device_id).ok_or(Error::DeviceNotFound)?;
         device.start_imu_stream()
     }
 
     /// Enable IMU streams on all devices and return a merged receiver.
     ///
     /// Call this before `start_all_pose_streams`.
-    pub fn start_all_imu_streams(&self) -> Result<crossbeam::channel::Receiver<ImuFrame>> {
+    pub fn start_all_imu_streams(&mut self) -> Result<crossbeam::channel::Receiver<ImuFrame>> {
         let (tx, rx) = crossbeam::channel::bounded(100);
 
-        for device in &self.devices {
+        for device in &mut self.devices {
             let device_rx = device.start_imu_stream()?;
             let tx_clone = tx.clone();
             std::thread::spawn(move || {

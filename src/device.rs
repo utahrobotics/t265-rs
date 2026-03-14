@@ -22,6 +22,10 @@ pub struct T265Device {
     /// Shared with the interrupt thread so IMU frames can be forwarded even after
     /// the thread is running.  Set by `start_imu_stream`, cleared on drop.
     imu_tx: Arc<Mutex<Option<crossbeam::channel::Sender<ImuFrame>>>>,
+    /// Whether fisheye streams should be included when sending DEV_RAW_STREAMS_CONTROL.
+    fisheye_enabled: bool,
+    /// Whether IMU streams should be included when sending DEV_RAW_STREAMS_CONTROL.
+    imu_enabled: bool,
 }
 
 impl T265Device {
@@ -35,6 +39,8 @@ impl T265Device {
             video_streaming: Arc::new(AtomicBool::new(false)),
             device_streaming: Arc::new(AtomicBool::new(false)),
             imu_tx: Arc::new(Mutex::new(None)),
+            fisheye_enabled: false,
+            imu_enabled: false,
         }
     }
 
@@ -335,8 +341,15 @@ impl T265Device {
                                     bytemuck::pod_read_unaligned(&buffer[..expected_size]);
                                 let pose =
                                     convert_pose_data_static(&msg.pose, time_offset, &device_id);
-                                if tx.send(pose).is_err() {
-                                    break;
+                                match tx.try_send(pose) {
+                                    Ok(_) => {}
+                                    Err(crossbeam::channel::TrySendError::Full(_)) => {
+                                        // Consumer is slow; drop this pose but keep polling
+                                        // the interrupt endpoint so the device doesn't stall.
+                                    }
+                                    Err(crossbeam::channel::TrySendError::Disconnected(_)) => {
+                                        break;
+                                    }
                                 }
                             }
                             DEV_SAMPLE
@@ -376,7 +389,8 @@ impl T265Device {
                                             z: imu_msg.metadata.fl_z,
                                             device_id: device_id.clone(),
                                         };
-                                        let _ = sender.send(ImuFrame { kind, sample });
+                                        // Drop IMU frame if consumer is slow; keep endpoint polled.
+                                        let _ = sender.try_send(ImuFrame { kind, sample });
                                     }
                                 }
                             }
@@ -467,13 +481,30 @@ impl T265Device {
     /// 1. Fetch all supported streams.
     /// 2. Drop duplicate IMU FPS entries (keep gyro@200 Hz, accel@62 Hz only) —
     ///    sending multiple entries for the same sensor is `INVALID_PARAMETER`.
-    /// 3. Set ALL entries to `bOutputMode = 0`, then enable IMU ones to 1.
+    /// 3. Send the entire filtered list via `DEV_RAW_STREAMS_CONTROL`.
     /// 4. Send the entire filtered list via `DEV_RAW_STREAMS_CONTROL`.
-    pub(crate) fn enable_imu_streams(&self) -> Result<()> {
+    pub(crate) fn enable_imu_streams(&mut self) -> Result<()> {
+        self.imu_enabled = true;
+        self.apply_stream_config()
+    }
+
+    /// Enable fisheye streams (called by manager's enable_all_video_streams).
+    pub(crate) fn enable_fisheye_streams(&mut self) -> Result<()> {
+        self.fisheye_enabled = true;
+        self.apply_stream_config()
+    }
+
+    /// Send a single DEV_RAW_STREAMS_CONTROL covering all desired stream types.
+    ///
+    /// librealsense always sends the complete supported stream list with per-entry
+    /// b_output_mode flags set.  Sending a partial list resets unlisted streams to
+    /// b_output_mode = 0, which is why separate fisheye + IMU calls used to clobber
+    /// each other.  This method merges both flags into one authoritative call.
+    fn apply_stream_config(&self) -> Result<()> {
         let raw = self.get_supported_video_streams()?;
 
-        // librealsense filters IMU streams by the only supported FPS.
-        // Sending multiple entries for the same sensor type causes INVALID_PARAMETER.
+        // librealsense de-duplicates IMU entries: keep gyro@200 Hz, accel@62 Hz only.
+        // Sending multiple entries for the same sensor type → INVALID_PARAMETER.
         let mut streams: Vec<SupportedRawStreamMessage> = raw
             .into_iter()
             .filter(|s| {
@@ -481,19 +512,29 @@ impl T265Device {
                 match t {
                     SENSOR_TYPE_GYRO => s.w_frames_per_second == 200,
                     SENSOR_TYPE_ACCELEROMETER => s.w_frames_per_second == 62,
-                    _ => false, // exclude fisheye; don't touch their output mode
+                    _ => true,
                 }
             })
             .collect();
 
-        if streams.is_empty() {
+        let has_imu = streams.iter().any(|s| {
+            let t = get_sensor_type(s.b_sensor_id);
+            t == SENSOR_TYPE_GYRO || t == SENSOR_TYPE_ACCELEROMETER
+        });
+
+        if self.imu_enabled && !has_imu {
             return Err(Error::Protocol(
                 "Device reports no IMU streams at the expected sample rates (gyro=200 Hz, accel=62 Hz)".to_string(),
             ));
         }
 
         for s in &mut streams {
-            s.b_output_mode = 1;
+            let t = get_sensor_type(s.b_sensor_id);
+            s.b_output_mode = match t {
+                SENSOR_TYPE_GYRO | SENSOR_TYPE_ACCELEROMETER => u8::from(self.imu_enabled),
+                SENSOR_TYPE_FISHEYE => u8::from(self.fisheye_enabled),
+                _ => 0,
+            };
         }
 
         self.enable_video_streams(&streams)
@@ -505,7 +546,7 @@ impl T265Device {
     /// `start_pose_stream`) will use to forward accelerometer and gyroscope
     /// samples.  Call this **before** `start_pose_stream` so the streams are
     /// enabled prior to `DEV_START`.
-    pub(crate) fn start_imu_stream(&self) -> Result<crossbeam::channel::Receiver<ImuFrame>> {
+    pub(crate) fn start_imu_stream(&mut self) -> Result<crossbeam::channel::Receiver<ImuFrame>> {
         self.enable_imu_streams()?;
 
         let (tx, rx) = crossbeam::channel::bounded(100);
@@ -837,12 +878,14 @@ impl T265Device {
                                                 device_id: device_id.clone(),
                                             };
 
-                                            if tx.send(video_frame).is_err() {
-                                                eprintln!(
-                                                    "Device {} video receiver dropped, stopping",
-                                                    device_id
-                                                );
-                                                break;
+                                            match tx.try_send(video_frame) {
+                                                Ok(_) => {}
+                                                Err(crossbeam::channel::TrySendError::Full(_)) => {
+                                                    // Consumer slow; drop frame, keep reading.
+                                                }
+                                                Err(crossbeam::channel::TrySendError::Disconnected(_)) => {
+                                                    break;
+                                                }
                                             }
                                         }
                                     }
