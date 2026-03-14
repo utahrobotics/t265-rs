@@ -6,7 +6,6 @@ use crate::temperature::{SensorTemperature, TempSensor};
 use crate::video::VideoFrame;
 use rusb::{DeviceHandle, GlobalContext};
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::mpsc;
 use std::sync::{Arc, Mutex};
 use std::time::Instant;
 
@@ -19,7 +18,7 @@ pub struct T265Device {
     video_streaming: Arc<AtomicBool>,
     /// Shared with the interrupt thread so IMU frames can be forwarded even after
     /// the thread is running.  Set by `start_imu_stream`, cleared on drop.
-    imu_tx: Arc<Mutex<Option<mpsc::Sender<ImuFrame>>>>,
+    imu_tx: Arc<Mutex<Option<crossbeam::channel::Sender<ImuFrame>>>>,
 }
 
 impl T265Device {
@@ -500,10 +499,10 @@ impl T265Device {
     /// `start_pose_stream`) will use to forward accelerometer and gyroscope
     /// samples.  Call this **before** `start_pose_stream` so the streams are
     /// enabled prior to `DEV_START`.
-    pub(crate) fn start_imu_stream(&self) -> Result<mpsc::Receiver<ImuFrame>> {
+    pub(crate) fn start_imu_stream(&self) -> Result<crossbeam::channel::Receiver<ImuFrame>> {
         self.enable_imu_streams()?;
 
-        let (tx, rx) = mpsc::channel();
+        let (tx, rx) = crossbeam::channel::bounded(100);
         *self.imu_tx.lock().unwrap() = Some(tx);
         Ok(rx)
     }
@@ -729,7 +728,7 @@ impl T265Device {
         Ok(())
     }
 
-    pub(crate) fn start_video_stream(&self) -> Result<mpsc::Receiver<VideoFrame>> {
+    pub(crate) fn start_video_stream(&self) -> Result<crossbeam::channel::Receiver<VideoFrame>> {
         if self.video_streaming.load(Ordering::SeqCst) {
             return Err(Error::DeviceAlreadyOpen);
         }
@@ -739,7 +738,7 @@ impl T265Device {
             self.start_streaming()?;
         }
 
-        let (tx, rx) = mpsc::channel();
+        let (tx, rx) = crossbeam::channel::bounded(100);
         let handle = self.handle.clone();
         let device_id = self.device_id.clone();
         let video_streaming = self.video_streaming.clone();

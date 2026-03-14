@@ -115,7 +115,10 @@ impl T265Manager {
     }
 
     /// Start Pose stream for a specific device
-    pub fn start_pose_stream(&mut self, device_id: &str) -> Result<crossbeam::channel::Receiver<Pose>> {
+    pub fn start_pose_stream(
+        &mut self,
+        device_id: &str,
+    ) -> Result<crossbeam::channel::Receiver<Pose>> {
         let device = self
             .get_device_mut(device_id)
             .ok_or(Error::DeviceNotFound)?;
@@ -201,7 +204,10 @@ impl T265Manager {
         Ok(())
     }
 
-    pub fn start_video_stream(&self, device_id: &str) -> Result<mpsc::Receiver<VideoFrame>> {
+    pub fn start_video_stream(
+        &self,
+        device_id: &str,
+    ) -> Result<crossbeam::channel::Receiver<VideoFrame>> {
         let device = self.get_device(device_id).ok_or(Error::DeviceNotFound)?;
         device.start_video_stream()
     }
@@ -215,7 +221,7 @@ impl T265Manager {
 
             std::thread::spawn(move || {
                 while let Ok(frame) = device_rx.recv() {
-                    if let Err(e) =  tx_clone.send(frame) {
+                    if let Err(e) = tx_clone.send(frame) {
                         eprintln!("Video frame send err: {e}");
                         break;
                     }
@@ -312,7 +318,10 @@ impl T265Manager {
     /// Call this before `start_all_pose_streams` / `start_pose_stream`.
     /// The interrupt thread started by those methods will forward both
     /// pose and IMU frames on their respective channels.
-    pub fn start_imu_stream(&self, device_id: &str) -> Result<mpsc::Receiver<ImuFrame>> {
+    pub fn start_imu_stream(
+        &self,
+        device_id: &str,
+    ) -> Result<crossbeam::channel::Receiver<ImuFrame>> {
         let device = self.get_device(device_id).ok_or(Error::DeviceNotFound)?;
         device.start_imu_stream()
     }
