@@ -9,7 +9,6 @@ use crate::protocol::{
 use crate::temperature::{SensorTemperature, TempSensor};
 use crate::video::VideoFrame;
 use rusb::{GlobalContext, UsbContext};
-use std::sync::mpsc;
 
 pub struct T265Manager {
     devices: Vec<T265Device>,
@@ -212,8 +211,8 @@ impl T265Manager {
         device.start_video_stream()
     }
 
-    pub fn start_all_video_streams(&self) -> Result<mpsc::Receiver<VideoFrame>> {
-        let (tx, rx) = mpsc::channel();
+    pub fn start_all_video_streams(&self) -> Result<crossbeam::channel::Receiver<VideoFrame>> {
+        let (tx, rx) = crossbeam::channel::bounded(100);
 
         for device in &self.devices {
             let device_rx = device.start_video_stream()?;
@@ -329,8 +328,8 @@ impl T265Manager {
     /// Enable IMU streams on all devices and return a merged receiver.
     ///
     /// Call this before `start_all_pose_streams`.
-    pub fn start_all_imu_streams(&self) -> Result<mpsc::Receiver<ImuFrame>> {
-        let (tx, rx) = mpsc::channel();
+    pub fn start_all_imu_streams(&self) -> Result<crossbeam::channel::Receiver<ImuFrame>> {
+        let (tx, rx) = crossbeam::channel::bounded(100);
 
         for device in &self.devices {
             let device_rx = device.start_imu_stream()?;
