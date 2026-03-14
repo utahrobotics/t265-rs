@@ -319,6 +319,7 @@ impl T265Device {
 
         std::thread::spawn(move || {
             let mut buffer = vec![0u8; 1024]; // librealsense uses BUFFER_SIZE = 1024
+            let mut pose_channel_full = false;
 
             while pose_streaming.load(Ordering::SeqCst) {
                 match handle.read_interrupt(
@@ -342,10 +343,17 @@ impl T265Device {
                                 let pose =
                                     convert_pose_data_static(&msg.pose, time_offset, &device_id);
                                 match tx.try_send(pose) {
-                                    Ok(_) => {}
+                                    Ok(_) => {
+                                        if pose_channel_full {
+                                            eprintln!("[t265] pose channel drained");
+                                            pose_channel_full = false;
+                                        }
+                                    }
                                     Err(crossbeam::channel::TrySendError::Full(_)) => {
-                                        // Consumer is slow; drop this pose but keep polling
-                                        // the interrupt endpoint so the device doesn't stall.
+                                        if !pose_channel_full {
+                                            eprintln!("[t265] WARNING: pose channel full, dropping poses");
+                                            pose_channel_full = true;
+                                        }
                                     }
                                     Err(crossbeam::channel::TrySendError::Disconnected(_)) => {
                                         break;
