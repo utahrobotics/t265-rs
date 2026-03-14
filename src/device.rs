@@ -882,7 +882,7 @@ impl T265Device {
                         // short read, continue
                     }
                     Err(rusb::Error::Timeout) => {
-                        eprintln!("timeout");
+                        eprintln!("[t265 device] Rusb timeout");
                     }
                     Err(e) => {
                         eprintln!("Device {} video stream error: {}", device_id, e);
