@@ -45,6 +45,8 @@ impl T265Manager {
             if device_desc.vendor_id() == T265_VID && device_desc.product_id() == T265_PID {
                 let handle = device.open()?;
 
+                let _ = handle.set_auto_detach_kernel_driver(true);
+
                 let timeout = std::time::Duration::from_secs(1);
                 let languages = handle.read_languages(timeout)?;
                 let serial = if let Some(lang) = languages.first() {

@@ -16,6 +16,9 @@ pub struct T265Device {
     pose_streaming: Arc<AtomicBool>,
     current_mode: u8,
     video_streaming: Arc<AtomicBool>,
+    /// Tracks whether DEV_START has been sent and DEV_STOP has not yet been sent.
+    /// Guards stop_streaming() so it is idempotent and DEV_STOP is sent at most once.
+    device_streaming: Arc<AtomicBool>,
     /// Shared with the interrupt thread so IMU frames can be forwarded even after
     /// the thread is running.  Set by `start_imu_stream`, cleared on drop.
     imu_tx: Arc<Mutex<Option<crossbeam::channel::Sender<ImuFrame>>>>,
@@ -30,6 +33,7 @@ impl T265Device {
             pose_streaming: Arc::new(AtomicBool::new(false)),
             current_mode: SIXDOF_MODE_ENABLE_MAPPING | SIXDOF_MODE_ENABLE_RELOCALIZATION,
             video_streaming: Arc::new(AtomicBool::new(false)),
+            device_streaming: Arc::new(AtomicBool::new(false)),
             imu_tx: Arc::new(Mutex::new(None)),
         }
     }
@@ -126,10 +130,18 @@ impl T265Device {
         };
 
         let _resp: BulkMessageResponseStart = self.bulk_request(&req)?;
+        self.device_streaming.store(true, Ordering::SeqCst);
         Ok(())
     }
 
     pub(crate) fn stop_streaming(&self) -> Result<()> {
+        // Guard: only send DEV_STOP once per DEV_START. Without this, multiple callers
+        // (stop_pose_stream, stop_video_stream, T265Device::drop) each try to stop the
+        // device, corrupting its state and causing it to re-enter bootloader mode.
+        if !self.device_streaming.swap(false, Ordering::SeqCst) {
+            return Ok(());
+        }
+
         let req = BulkMessageRequestStop {
             header: BulkMessageRequestHeader {
                 dw_length: 4,
@@ -437,7 +449,9 @@ impl T265Device {
     }
 
     pub(crate) fn stop_pose_stream(&mut self) -> Result<()> {
-        self.pose_streaming.store(false, Ordering::SeqCst);
+        if !self.pose_streaming.swap(false, Ordering::SeqCst) {
+            return Ok(()); // Already stopped; avoids extra DEV_STOP and spurious 200ms sleep
+        }
         std::thread::sleep(std::time::Duration::from_millis(200));
         self.stop_streaming()?;
         Ok(())

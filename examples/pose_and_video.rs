@@ -1,3 +1,5 @@
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::Arc;
 use t265_rs::{Result, T265Manager};
 
 fn main() -> Result<()> {
@@ -9,12 +11,20 @@ fn main() -> Result<()> {
         return Ok(());
     }
 
+    let running = Arc::new(AtomicBool::new(true));
+    let r = running.clone();
+    ctrlc::set_handler(move || {
+        r.store(false, Ordering::SeqCst);
+    })
+    .expect("Error setting Ctrl-C handler");
+
     manager.enable_all_video_streams()?;
 
     let pose_rx = manager.start_all_pose_streams()?;
     let video_rx = manager.start_all_video_streams()?;
 
-    for i in 0..100 {
+    let mut i = 0usize;
+    while running.load(Ordering::SeqCst) {
         if let Ok(pose) = pose_rx.recv_timeout(std::time::Duration::from_millis(50)) {
             println!(
                 "Pose {}: pos=[{:.2}, {:.2}, {:.2}] conf={:?}",
@@ -24,6 +34,7 @@ fn main() -> Result<()> {
                 pose.translation[2],
                 pose.tracker_confidence
             );
+            i += 1;
         }
 
         while let Ok(frame) = video_rx.try_recv() {
@@ -34,5 +45,6 @@ fn main() -> Result<()> {
         }
     }
 
+    // Drop of T265Manager sends DEV_STOP here before the process exits.
     Ok(())
 }
