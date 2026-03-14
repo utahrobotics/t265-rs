@@ -115,20 +115,20 @@ impl T265Manager {
     }
 
     /// Start Pose stream for a specific device
-    pub fn start_pose_stream(&mut self, device_id: &str) -> Result<mpsc::Receiver<Pose>> {
+    pub fn start_pose_stream(&mut self, device_id: &str) -> Result<crossbeam::channel::Receiver<Pose>> {
         let device = self
             .get_device_mut(device_id)
             .ok_or(Error::DeviceNotFound)?;
         device.sync_time()?;
 
-        let (tx, rx) = mpsc::channel();
+        let (tx, rx) = crossbeam::channel::bounded(100);
         device.start_pose_stream(tx)?;
         Ok(rx)
     }
 
     /// Start Pose stream for all devices
-    pub fn start_all_pose_streams(&mut self) -> Result<mpsc::Receiver<Pose>> {
-        let (tx, rx) = mpsc::channel();
+    pub fn start_all_pose_streams(&mut self) -> Result<crossbeam::channel::Receiver<Pose>> {
+        let (tx, rx) = crossbeam::channel::bounded(100);
 
         for device in &mut self.devices {
             device.sync_time()?;
@@ -211,12 +211,12 @@ impl T265Manager {
 
         for device in &self.devices {
             let device_rx = device.start_video_stream()?;
-            let device_id = device.device_id().to_string();
             let tx_clone = tx.clone();
 
             std::thread::spawn(move || {
                 while let Ok(frame) = device_rx.recv() {
-                    if tx_clone.send(frame).is_err() {
+                    if let Err(e) =  tx_clone.send(frame) {
+                        eprintln!("Video frame send err: {e}");
                         break;
                     }
                 }
@@ -328,7 +328,8 @@ impl T265Manager {
             let tx_clone = tx.clone();
             std::thread::spawn(move || {
                 while let Ok(frame) = device_rx.recv() {
-                    if tx_clone.send(frame).is_err() {
+                    if let Err(e) = tx_clone.send(frame) {
+                        eprintln!("Pose send error: {e}");
                         break;
                     }
                 }

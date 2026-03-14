@@ -289,7 +289,7 @@ impl T265Device {
         }
     }
 
-    pub(crate) fn start_pose_stream(&mut self, tx: mpsc::Sender<Pose>) -> Result<()> {
+    pub(crate) fn start_pose_stream(&mut self, tx: crossbeam::channel::Sender<Pose>) -> Result<()> {
         self.enable_6dof(self.current_mode)?;
         self.start_streaming()?;
 

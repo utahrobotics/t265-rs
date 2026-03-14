@@ -8,3 +8,4 @@ rusb = "0.9"
 bytemuck = { version = "1.14", features = ["derive"] }
 thiserror = "1.0"
 sha1 = "0.10"
+crossbeam = "0.8.0"
