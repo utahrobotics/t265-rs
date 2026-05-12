@@ -182,12 +182,11 @@ impl T265Device {
         Ok(())
     }
 
-    pub fn read_pose(&self) -> Result<Pose> {
+    pub fn read_pose(handle: &Arc<DeviceHandle<GlobalContext>>, time_offset_ns: i64, device_id: &str) -> Result<Pose> {
         let mut buffer = vec![0u8; 1024]; // librealsense uses BUFFER_SIZE = 1024
 
         loop {
-            let size =
-                self.handle
+            let size = handle
                     .read_interrupt(ENDPOINT_INTERRUPT_IN, &mut buffer, USB_TIMEOUT)?;
 
             if size < std::mem::size_of::<InterruptMessageHeader>() {
@@ -213,7 +212,7 @@ impl T265Device {
 
                     let msg: InterruptMessageGetPose =
                         bytemuck::pod_read_unaligned(&buffer[..expected_size]);
-                    return Ok(self.convert_pose_data(&msg.pose));
+                    return Ok(convert_pose_data_static(&msg.pose, time_offset_ns, device_id));
                 }
                 DEV_ERROR => {
                     if size >= 8 {
@@ -227,10 +226,12 @@ impl T265Device {
                         let msg: InterruptMessageSlamError =
                             bytemuck::pod_read_unaligned(&buffer[..8]);
                         let status = msg.w_status;
-                        eprintln!("Warning: SLAM error {:#x}, continuing...", status);
-                        continue;
+                        eprintln!("[T265-RS] Warning: SLAM error {:#x}", status);
+                    } else {
+                        eprintln!("[T265-RS] Warning: unspecified SLAM error.");
                     }
-                    continue;
+
+                    return Err(Error::SlamError);
                 }
                 SLAM_RELOCALIZATION_EVENT => {
                     if size >= 18 {
@@ -249,9 +250,10 @@ impl T265Device {
                                 session_id, timestamp_ns
                             );
                         }
-                        continue;
+                    } else {
+                        eprintln!("[T265-RS] SLAM relocalization event");
                     }
-                    continue;
+                    return Err(Error::SlamRelocalization);
                 }
                 DEV_STATUS => {
                     if size >= 8 {
@@ -290,7 +292,7 @@ impl T265Device {
         }
     }
 
-    fn convert_pose_data(&self, data: &PoseData) -> Pose {
+    fn convert_pose_data(time_offset_ns: i64, device_id: &str, data: &PoseData) -> Pose {
         Pose {
             translation: [data.fl_x, data.fl_y, data.fl_z],
             rotation: [data.fl_qi, data.fl_qj, data.fl_qk, data.fl_qr],
@@ -298,15 +300,15 @@ impl T265Device {
             angular_velocity: [data.fl_vax, data.fl_vay, data.fl_vaz],
             acceleration: [data.fl_ax, data.fl_ay, data.fl_az],
             angular_acceleration: [data.fl_aax, data.fl_aay, data.fl_aaz],
-            timestamp_ns: (data.ll_nanoseconds as i64 + self.time_offset_ns) as u64,
+            timestamp_ns: (data.ll_nanoseconds as i64 + time_offset_ns) as u64,
             tracker_confidence: Confidence::from(data.dw_tracker_confidence),
             mapper_confidence: Confidence::from(data.dw_mapper_confidence), // Use raw value like librealsense
             tracker_state: TrackerState::from(data.dw_tracker_state),
-            device_id: self.device_id.clone(),
+            device_id: device_id.to_string(),
         }
     }
 
-    pub(crate) fn start_pose_stream(&mut self, tx: crossbeam::channel::Sender<Pose>) -> Result<()> {
+    pub(crate) fn start_pose_stream(&mut self, tx: crossbeam::channel::Sender<Result<Pose>>) -> Result<()> {
         self.enable_6dof(self.current_mode)?;
         self.start_streaming()?;
 
@@ -314,156 +316,12 @@ impl T265Device {
         let device_id = self.device_id.clone();
         let time_offset = self.time_offset_ns;
         let pose_streaming = Arc::clone(&self.pose_streaming);
-        let imu_tx = Arc::clone(&self.imu_tx);
         pose_streaming.store(true, Ordering::SeqCst);
 
         std::thread::spawn(move || {
-            let mut buffer = vec![0u8; 1024]; // librealsense uses BUFFER_SIZE = 1024
-            let mut pose_channel_full = false;
-
             while pose_streaming.load(Ordering::SeqCst) {
-                match handle.read_interrupt(
-                    ENDPOINT_INTERRUPT_IN,
-                    &mut buffer,
-                    std::time::Duration::from_millis(1000),
-                ) {
-                    Ok(size) if size >= std::mem::size_of::<InterruptMessageHeader>() => {
-                        let header: InterruptMessageHeader = bytemuck::pod_read_unaligned(
-                            &buffer[..std::mem::size_of::<InterruptMessageHeader>()],
-                        );
-                        let msg_id = header.w_message_id;
-
-                        match msg_id {
-                            DEV_GET_POSE
-                                if size >= std::mem::size_of::<InterruptMessageGetPose>() =>
-                            {
-                                let expected_size = std::mem::size_of::<InterruptMessageGetPose>();
-                                let msg: InterruptMessageGetPose =
-                                    bytemuck::pod_read_unaligned(&buffer[..expected_size]);
-                                let pose =
-                                    convert_pose_data_static(&msg.pose, time_offset, &device_id);
-                                match tx.try_send(pose) {
-                                    Ok(_) => {
-                                        if pose_channel_full {
-                                            eprintln!("[t265] pose channel drained");
-                                            pose_channel_full = false;
-                                        }
-                                    }
-                                    Err(crossbeam::channel::TrySendError::Full(_)) => {
-                                        if !pose_channel_full {
-                                            eprintln!("[t265] WARNING: pose channel full, dropping poses");
-                                            pose_channel_full = true;
-                                        }
-                                    }
-                                    Err(crossbeam::channel::TrySendError::Disconnected(_)) => {
-                                        break;
-                                    }
-                                }
-                            }
-                            DEV_SAMPLE
-                                if size >= std::mem::size_of::<InterruptMessageImuStream>() =>
-                            {
-                                let imu_msg: InterruptMessageImuStream =
-                                    bytemuck::pod_read_unaligned(
-                                        &buffer[..std::mem::size_of::<InterruptMessageImuStream>()],
-                                    );
-                                let sensor_type =
-                                    get_sensor_type(imu_msg.raw_stream_header.b_sensor_id);
-                                let kind = match sensor_type {
-                                    SENSOR_TYPE_ACCELEROMETER => ImuKind::Accel,
-                                    SENSOR_TYPE_GYRO => ImuKind::Gyro,
-                                    _ => {
-                                        eprintln!(
-                                            "Device {} unknown DEV_SAMPLE sensor type: {}",
-                                            device_id, sensor_type
-                                        );
-                                        continue;
-                                    }
-                                };
-                                if let Ok(guard) = imu_tx.lock() {
-                                    if let Some(ref sender) = *guard {
-                                        let sample = ImuSample {
-                                            sensor_index: get_sensor_index(
-                                                imu_msg.raw_stream_header.b_sensor_id,
-                                            ),
-                                            timestamp_ns: (imu_msg.raw_stream_header.ll_nanoseconds
-                                                as i64
-                                                + time_offset)
-                                                as u64,
-                                            frame_id: imu_msg.raw_stream_header.dw_frame_id,
-                                            temperature: imu_msg.metadata.fl_temperature,
-                                            x: imu_msg.metadata.fl_x,
-                                            y: imu_msg.metadata.fl_y,
-                                            z: imu_msg.metadata.fl_z,
-                                            device_id: device_id.clone(),
-                                        };
-                                        // Drop IMU frame if consumer is slow; keep endpoint polled.
-                                        let _ = sender.try_send(ImuFrame { kind, sample });
-                                    }
-                                }
-                            }
-                            DEV_ERROR if size >= 8 => {
-                                let msg: InterruptMessageError =
-                                    bytemuck::pod_read_unaligned(&buffer[..8]);
-                                let status = msg.w_status;
-                                eprintln!("Device {} error: {:#x}", device_id, status);
-                            }
-                            SLAM_ERROR if size >= 8 => {
-                                let msg: InterruptMessageSlamError =
-                                    bytemuck::pod_read_unaligned(&buffer[..8]);
-                                let status = msg.w_status;
-                                eprintln!("Device {} SLAM error: {:#x}", device_id, status);
-                            }
-                            SLAM_RELOCALIZATION_EVENT if size >= 18 => {
-                                let msg: InterruptMessageSlamRelocalizationEvent =
-                                    bytemuck::pod_read_unaligned(&buffer[..18]);
-                                let timestamp_ns = msg.ll_nanoseconds;
-                                let session_id = msg.w_session_id;
-                                if session_id == 0 {
-                                    eprintln!(
-                                        "Device {} Relocalization: Recovered position within current session at {} ns",
-                                        device_id, timestamp_ns
-                                    );
-                                } else {
-                                    eprintln!(
-                                        "Device {} Relocalization: Recovered position from previous session {} at {} ns",
-                                        device_id, session_id, timestamp_ns
-                                    );
-                                }
-                            }
-                            DEV_STATUS if size >= 8 => {
-                                let msg: InterruptMessageStatus =
-                                    bytemuck::pod_read_unaligned(&buffer[..8]);
-                                let status = msg.w_status;
-                                match status {
-                                    DEVICE_STOPPED => {
-                                        if pose_streaming.load(Ordering::SeqCst) {
-                                            eprintln!("Device {} received stale STOPPED message, ignoring", device_id);
-                                        } else {
-                                            eprintln!("Device {} stopped", device_id);
-                                            break;
-                                        }
-                                    }
-                                    TEMPERATURE_WARNING => {
-                                        eprintln!("Device {} temperature warning", device_id);
-                                    }
-                                    _ => {
-                                        eprintln!("Device {device_id} reported unknown status message: {status}");
-                                    }
-                                }
-                            }
-                            _ => {
-                                eprintln!("Device {device_id} reported unknown or incomplete msg id: {msg_id}");
-                            }
-                        }
-                    }
-                    Err(rusb::Error::Timeout) => continue,
-                    Err(e) => {
-                        eprintln!("Read error on device {}: {:?}", device_id, e);
-                        break;
-                    }
-                    _ => {}
-                }
+                let msg = T265Device::read_pose(&handle, time_offset, &device_id);
+                tx.send(msg);
             }
         });
 

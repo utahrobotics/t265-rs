@@ -119,7 +119,7 @@ impl T265Manager {
     pub fn start_pose_stream(
         &mut self,
         device_id: &str,
-    ) -> Result<crossbeam::channel::Receiver<Pose>> {
+    ) -> Result<crossbeam::channel::Receiver<Result<Pose>>> {
         let device = self
             .get_device_mut(device_id)
             .ok_or(Error::DeviceNotFound)?;
@@ -131,7 +131,7 @@ impl T265Manager {
     }
 
     /// Start Pose stream for all devices
-    pub fn start_all_pose_streams(&mut self) -> Result<crossbeam::channel::Receiver<Pose>> {
+    pub fn start_all_pose_streams(&mut self) -> Result<crossbeam::channel::Receiver<Result<Pose>>> {
         let (tx, rx) = crossbeam::channel::bounded(100);
 
         for device in &mut self.devices {

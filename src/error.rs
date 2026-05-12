@@ -46,6 +46,12 @@ pub enum Error {
 
     #[error("Message too short: expected {expected}, got {actual}")]
     MessageTooShort { expected: usize, actual: usize },
+
+    #[error("SLAM_ERROR")]
+    SlamError,
+
+    #[error("slam relocalization event")]
+    SlamRelocalization,
 }
 
 impl Error {
