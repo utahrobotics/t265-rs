@@ -25,7 +25,7 @@ fn main() -> Result<()> {
 
     let mut i = 0usize;
     while running.load(Ordering::SeqCst) {
-        if let Ok(pose) = pose_rx.recv_timeout(std::time::Duration::from_millis(50)) {
+        if let Ok(Ok(pose)) = pose_rx.recv_timeout(std::time::Duration::from_millis(50)) {
             println!(
                 "Pose {}: pos=[{:.2}, {:.2}, {:.2}] conf={:?}",
                 i,

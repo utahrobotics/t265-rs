@@ -50,7 +50,7 @@ fn main() -> Result<()> {
         }
 
         // Print the latest pose if one is ready
-        if let Ok(pose) = pose_rx.recv_timeout(Duration::from_millis(5)) {
+        if let Ok(Ok(pose)) = pose_rx.recv_timeout(Duration::from_millis(5)) {
             println!(
                 "[{}] POSE   pos=[{:6.3} {:6.3} {:6.3}] m  \
                  vel=[{:6.3} {:6.3} {:6.3}] m/s  conf={:?}",
